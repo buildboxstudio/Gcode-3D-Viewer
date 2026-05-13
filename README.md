@@ -88,45 +88,6 @@ python build_exe.py
 | Cura | `; thumbnail_QPix begin WxH` |
 | Elegoo | `;gimage:` / `;simage:` |
 
-## Upload ke GitHub
-
-Cara cepat upload project ini ke GitHub:
-
-```bash
-# 1. Buka terminal di folder project ini
-cd "d:\Projek Aplikasi\Gcode Viewer"
-
-# 2. Inisialisasi git
-git init
-git add .
-git commit -m "Initial commit - GCode 3D Viewer v3.0"
-
-# 3. Buat repository baru di github.com (klik New Repository)
-#    Nama: gcode-3d-viewer
-#    Jangan centang "Add README" (sudah ada)
-
-# 4. Hubungkan dan push
-git remote add origin https://github.com/USERNAME/gcode-3d-viewer.git
-git branch -M main
-git push -u origin main
-```
-
-Ganti `USERNAME` dengan username GitHub kamu.
-
-Untuk release `.exe`:
-1. Buka tab **Releases** di repository GitHub
-2. Klik **Create a new release**
-3. Tag: `v3.0.0`
-4. Upload file `dist/GCodeViewer.exe` sebagai attachment
-5. Publish
-
-## Requirements (Python)
-
-- Windows 10/11
-- Python 3.10+
-- Pillow
-- windnd
-
 ## Credits
 
 Developed by **BuildBox Studio**

@@ -2,6 +2,10 @@
 
 Interactive 3D preview application for `.gcode` files from 3D printing slicers.
 
+<img width="522" height="398" alt="image" src="https://github.com/user-attachments/assets/089e2a5e-f618-404d-adf8-01a74c00776c" /><img width="522" height="398" alt="Video_2026_05_16-1_edit_0" src="https://github.com/user-attachments/assets/d58dcc7f-237d-4af7-ab3c-6132927c4773" />
+
+
+
 ## Features
 
 - **Drag & Drop** — Drop .gcode files directly from Explorer

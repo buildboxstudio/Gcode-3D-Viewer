@@ -1,0 +1,6 @@
+; first_layer_height = 0.25
+G28
+G1 Z0.25
+G1 X10 Y10 E1 F1500
+G1 Z0.55
+G1 X20 Y20 E2

@@ -1,0 +1,5 @@
+; no-space flavor (RepRap/Klipper style)
+G28
+G1X10Y10F3000
+G1X50Y50E10F1500
+G1X10Y50E20

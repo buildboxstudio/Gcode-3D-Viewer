@@ -10,14 +10,27 @@ Interactive 3D preview application for `.gcode` files from 3D printing slicers.
 
 - **Drag & Drop** — Drop .gcode files directly from Explorer
 - **3D Interactive View** — Rotate, pan, zoom in real-time
+- **Print Info** — Layer height, first layer height, print duration, fan speed, slicer detection
+- **Fan Speed Editor** — Adjust fan speed (%) and save as a new gcode file
 - **Multi-Language** — 12 languages: English, Indonesian, Chinese, Japanese, Korean, German, French, Spanish, Portuguese, Russian, Turkish, Italian
-- **Light/Dark Theme** — Switch between dark and light mode
+- **Light/Dark Theme** — Switch between dark and light mode, applied instantly
 - **Layer Navigation** — Slider to view layer-by-layer
 - **Color Gradient** — Height-based coloring (blue → green → yellow → red)
 - **View Presets** — Top, Front, Side with one click
 - **Embedded Thumbnail** — Extract and view thumbnails from slicers
 - **Screenshot Export** — Save 3D view to PNG/JPG
+- **Custom App Icon** — 3D-printing themed icon
 - **Settings Persistence** — Language and theme saved automatically
+
+## Print Info Detected
+
+| Info | Source |
+|------|--------|
+| Layer Height | Computed from Z deltas + slicer config comment |
+| First Layer Height | First positive Z value |
+| Print Duration | Slicer estimate (PrusaSlicer/SuperSlicer/Cura/Orca/Bambu) |
+| Fan Speed | Parsed from M106/M107 commands |
+| Slicer | Auto-detected from header comments |
 
 ## Menu Bar
 
@@ -26,6 +39,7 @@ Interactive 3D preview application for `.gcode` files from 3D printing slicers.
 | File | Open, Save Screenshot, Save Thumbnail, Exit |
 | View | Reset, Top/Front/Side, Zoom, Travel toggle |
 | Thumbnail | View embedded, Save |
+| Tools | Edit Fan Speed |
 | Settings | Language (12), Theme (Dark/Light) |
 | Help | Shortcuts, About |
 
@@ -75,6 +89,8 @@ English, Bahasa Indonesia, 中文, 日本語, 한국어, Deutsch, Français, Esp
 - **Dark** (default) — Dark background, easy on the eyes
 - **Light** — Bright background for well-lit environments
 
+Language and theme switches apply immediately, no restart needed.
+
 Settings are saved to `~/.gcode_viewer/settings.json`.
 
 ## Build EXE
@@ -88,9 +104,10 @@ python build_exe.py
 
 | Slicer | Format |
 |--------|--------|
-| PrusaSlicer / SuperSlicer | `; thumbnail begin WxH` |
+| PrusaSlicer / SuperSlicer / OrcaSlicer / Bambu Studio | `; thumbnail begin WxH` |
 | Cura | `; thumbnail_QPix begin WxH` |
-| Elegoo | `;gimage:` / `;simage:` |
+
+Both LF and CRLF line endings are handled.
 
 ## Credits
 

@@ -1,5 +1,5 @@
 """
-GCode 3D Viewer v3.0
+GCode 3D Viewer
 Windows application for interactive 3D preview of .gcode files
 """
 
@@ -29,9 +29,18 @@ from languages import LANGUAGES, get_text
 from themes import THEMES, get_theme
 
 APP_NAME = "GCode 3D Viewer"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.2.0"
 CONFIG_DIR = os.path.join(os.path.expanduser('~'), '.gcode_viewer')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'settings.json')
+
+# GCode word: letter + number, with or without space ("G1 X10" or "G1X10")
+WORD_RE = re.compile(r'([A-Za-z])\s*([-+]?\d*\.?\d+)')
+
+
+def resource_path(rel):
+    """Get absolute path to resource, works for dev and PyInstaller bundle."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
 
 
 def load_config():
@@ -69,6 +78,14 @@ class GCodeParser:
             'min_z': float('inf'), 'max_z': float('-inf'),
         }
         self.layer_segments = {}
+        # Metadata
+        self.layer_height = 0.0
+        self.first_layer_height = 0.0
+        self.fan_speeds = set()       # raw S values (0-255)
+        self.print_time = None        # human readable string
+        self.print_time_seconds = None
+        self.filament_used = None
+        self.slicer = None
 
     def parse(self, filepath):
         self.segments = []
@@ -76,6 +93,13 @@ class GCodeParser:
         self.layer_segments = {}
         self.bounds = {k: float('inf') if 'min' in k else float('-inf')
                        for k in self.bounds}
+        self.layer_height = 0.0
+        self.first_layer_height = 0.0
+        self.fan_speeds = set()
+        self.print_time = None
+        self.print_time_seconds = None
+        self.filament_used = None
+        self.slicer = None
 
         cx, cy, cz, ce = 0.0, 0.0, 0.0, 0.0
         rel_e = False
@@ -85,36 +109,57 @@ class GCodeParser:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith(';'):
+                    if not line:
+                        continue
+                    if line.startswith(';'):
+                        self._parse_comment(line)
                         continue
                     if ';' in line:
                         line = line[:line.index(';')]
-                    parts = line.split()
-                    if not parts:
+                    words = WORD_RE.findall(line)
+                    if words and words[0][0].upper() == 'N':
+                        words = words[1:]  # line number prefix
+                    if not words:
                         continue
-                    cmd = parts[0].upper()
+                    cmd = (words[0][0] + words[0][1]).upper()
+                    params = [(c.upper(), v) for c, v in words[1:]]
                     if cmd == 'M83':
                         rel_e = True
                     elif cmd == 'M82':
                         rel_e = False
+                    elif cmd == 'G92':
+                        if not params:
+                            cx = cy = cz = ce = 0.0
+                        for c, v in params:
+                            if c == 'X': cx = float(v)
+                            elif c == 'Y': cy = float(v)
+                            elif c == 'Z': cz = float(v)
+                            elif c == 'E': ce = float(v)
+                    elif cmd in ('M106', 'M107'):
+                        if cmd == 'M107':
+                            self.fan_speeds.add(0.0)
+                        else:
+                            for c, v in params:
+                                if c == 'S':
+                                    try:
+                                        self.fan_speeds.add(float(v))
+                                    except ValueError:
+                                        pass
                     elif cmd in ('G0', 'G1'):
                         nx, ny, nz, ne, has_e = cx, cy, cz, ce, False
-                        for p in parts[1:]:
-                            c = p[0].upper()
-                            try:
-                                v = float(p[1:])
-                            except (ValueError, IndexError):
-                                continue
-                            if c == 'X': nx = v
-                            elif c == 'Y': ny = v
-                            elif c == 'Z': nz = v
+                        for c, v in params:
+                            if c == 'X': nx = float(v)
+                            elif c == 'Y': ny = float(v)
+                            elif c == 'Z': nz = float(v)
                             elif c == 'E':
                                 has_e = True
-                                ne = (ce + v) if rel_e else v
-                        if nz != cz and nz not in layer_heights:
-                            layer_heights.add(nz)
+                                ne = (ce + float(v)) if rel_e else float(v)
                         if nx != cx or ny != cy or nz != cz:
                             st = 'extrude' if (has_e and ne > ce) else 'travel'
+                            # Layers come from extrusion Z only, so z-hops
+                            # and nozzle lifts don't create phantom layers.
+                            if st == 'extrude' and nz not in layer_heights:
+                                layer_heights.add(nz)
                             self.segments.append((cx, cy, cz, nx, ny, nz, st))
                             for x in (cx, nx):
                                 self.bounds['min_x'] = min(self.bounds['min_x'], x)
@@ -133,7 +178,100 @@ class GCodeParser:
         for idx, seg in enumerate(self.segments):
             li = self._find_layer(max(seg[2], seg[5]))
             self.layer_segments.setdefault(li, []).append(idx)
+
+        self._compute_layer_height()
         return len(self.segments) > 0
+
+    def _compute_layer_height(self):
+        """Determine typical layer height from Z deltas (mode).
+
+        Slicer comment value (set during parsing) wins; this is fallback.
+        """
+        positive = [z for z in self.layers if z > 0.0]
+        if len(self.layers) >= 2 and not self.layer_height:
+            diffs = []
+            for i in range(len(self.layers) - 1):
+                d = round(self.layers[i + 1] - self.layers[i], 3)
+                if d > 0:
+                    diffs.append(d)
+            if diffs:
+                from collections import Counter
+                self.layer_height = Counter(diffs).most_common(1)[0][0]
+        # First layer height = first positive Z value
+        if positive:
+            self.first_layer_height = round(positive[0], 3)
+        elif self.layer_height:
+            self.first_layer_height = self.layer_height
+
+    def _parse_comment(self, line):
+        """Extract metadata from comment lines (print time, layer height, etc)."""
+        low = line.lower()
+        # Detect slicer
+        if self.slicer is None:
+            if 'prusaslicer' in low: self.slicer = 'PrusaSlicer'
+            elif 'superslicer' in low: self.slicer = 'SuperSlicer'
+            elif 'cura' in low: self.slicer = 'Cura'
+            elif 'orca' in low: self.slicer = 'OrcaSlicer'
+            elif 'bambu' in low: self.slicer = 'BambuStudio'
+            elif 'ideamaker' in low: self.slicer = 'ideaMaker'
+
+        # Print time — PrusaSlicer / SuperSlicer / Orca
+        if self.print_time is None and 'estimated printing time' in low:
+            m = re.search(r'=\s*(.+)$', line.strip())
+            if m:
+                self.print_time = m.group(1).strip()
+                self.print_time_seconds = self._time_to_seconds(self.print_time)
+        # Cura: ;TIME:7530
+        if self.print_time_seconds is None:
+            m = re.match(r';TIME:\s*([\d.]+)', line.strip(), re.IGNORECASE)
+            if m:
+                self.print_time_seconds = float(m.group(1))
+                self.print_time = self._seconds_to_str(self.print_time_seconds)
+        # Bambu/Orca: ; total estimated time: ...  or  ; model printing time: ...
+        if self.print_time is None and ('total estimated time' in low or
+                                        'model printing time' in low):
+            m = re.search(r':\s*(.+)$', line.strip())
+            if m:
+                self.print_time = m.group(1).strip()
+                self.print_time_seconds = self._time_to_seconds(self.print_time)
+
+        # Layer height from config comment (must not match first_layer_height)
+        if 'layer_height' in low and '=' in line:
+            m = re.search(r'(?<!first_)layer_height\s*=\s*([\d.]+)', low)
+            if m and not self.layer_height:
+                try: self.layer_height = float(m.group(1))
+                except ValueError: pass
+        elif 'layer height' in low and ':' in line:
+            m = re.search(r'layer height\s*:\s*([\d.]+)', low)
+            if m and not self.layer_height:
+                try: self.layer_height = float(m.group(1))
+                except ValueError: pass
+
+        # Filament used
+        if self.filament_used is None:
+            m = re.search(r'filament used \[mm\]\s*=\s*([\d.]+)', low)
+            if m:
+                self.filament_used = float(m.group(1))
+
+    @staticmethod
+    def _time_to_seconds(s):
+        """Convert '2h 5m 30s' or '1d 2h 3m' to seconds."""
+        total = 0
+        for val, unit in re.findall(r'(\d+)\s*([dhms])', s.lower()):
+            v = int(val)
+            total += v * {'d': 86400, 'h': 3600, 'm': 60, 's': 1}[unit]
+        return total if total > 0 else None
+
+    @staticmethod
+    def _seconds_to_str(sec):
+        sec = int(sec)
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            return f"{h}h {m}m {s}s"
+        if m > 0:
+            return f"{m}m {s}s"
+        return f"{s}s"
 
     def _find_layer(self, z):
         if not self.layers:
@@ -166,8 +304,8 @@ class ThumbnailExtractor:
                 content = f.read()
         except Exception:
             return thumbnails
-        for pat, tag in [(r'; thumbnail begin (\d+)x(\d+) \d+\n(.*?); thumbnail end', True),
-                         (r'; thumbnail_QPix begin (\d+)x(\d+) \d+\n(.*?); thumbnail_QPix end', True)]:
+        for pat in [r'; thumbnail begin (\d+)x(\d+) \d+\r?\n(.*?); thumbnail end',
+                    r'; thumbnail_QPix begin (\d+)x(\d+) \d+\r?\n(.*?); thumbnail_QPix end']:
             for m in re.finditer(pat, content, re.DOTALL):
                 w, h = int(m.group(1)), int(m.group(2))
                 b64 = ''.join(l.strip().lstrip(';').strip()
@@ -413,9 +551,19 @@ class GCodeViewerApp:
         self.root.geometry("1050x750")
         self.root.minsize(800, 600)
 
+        # App icon
+        try:
+            ico = resource_path('icon.ico')
+            if os.path.exists(ico):
+                self.root.iconbitmap(ico)
+        except Exception:
+            pass
+
         self.parser = GCodeParser()
         self.thumbnails = []
         self.current_filepath = None
+        self.lang_var = tk.StringVar(value=self.lang)
+        self.theme_var = tk.StringVar(value=self.theme_name)
 
         self._apply_theme()
         self._setup_menu()
@@ -473,6 +621,11 @@ class GCodeViewerApp:
         tm.add_command(label=self.t('view_thumbnail'), command=self._show_thumbnail)
         tm.add_command(label=self.t('save_thumbnail'), command=self._save_thumbnail_file)
 
+        # Tools
+        tlm = tk.Menu(menubar, tearoff=0, **mc)
+        menubar.add_cascade(label=self.t('tools'), menu=tlm)
+        tlm.add_command(label=self.t('edit_fan'), command=self._show_fan_editor)
+
         # Settings
         sm = tk.Menu(menubar, tearoff=0, **mc)
         menubar.add_cascade(label=self.t('settings'), menu=sm)
@@ -484,15 +637,18 @@ class GCodeViewerApp:
             lang_menu.add_radiobutton(
                 label=data['name'],
                 command=lambda c=code: self._change_language(c),
-                value=code
+                value=code,
+                variable=self.lang_var
             )
 
         # Theme submenu
         theme_menu = tk.Menu(sm, tearoff=0, **mc)
         sm.add_cascade(label=self.t('theme'), menu=theme_menu)
-        theme_menu.add_radiobutton(label=self.t('theme_dark'),
+        theme_menu.add_radiobutton(label=self.t('theme_dark'), value='dark',
+                                   variable=self.theme_var,
                                    command=lambda: self._change_theme('dark'))
-        theme_menu.add_radiobutton(label=self.t('theme_light'),
+        theme_menu.add_radiobutton(label=self.t('theme_light'), value='light',
+                                   variable=self.theme_var,
                                    command=lambda: self._change_theme('light'))
 
         # Help
@@ -571,6 +727,13 @@ class GCodeViewerApp:
                                      wraplength=185)
         self.stats_label.pack(anchor=tk.W, pady=(2, 15))
 
+        # Print Info section (layer height, print time, fan)
+        ttk.Label(lp, text=f"\u2139\ufe0f {self.t('print_info')}",
+                  style='PanelTitle.TLabel').pack(anchor=tk.W)
+        self.meta_label = ttk.Label(lp, text="—", style='PanelInfo.TLabel',
+                                    wraplength=185)
+        self.meta_label.pack(anchor=tk.W, pady=(2, 15))
+
         ttk.Label(lp, text=f"\U0001f5b1\ufe0f {self.t('controls')}",
                   style='PanelTitle.TLabel').pack(anchor=tk.W)
         ctrl = f"{self.t('ctrl_rotate')}\n{self.t('ctrl_pan')}\n{self.t('ctrl_zoom')}\n{self.t('ctrl_reset')}\n{self.t('ctrl_open')}"
@@ -620,7 +783,6 @@ class GCodeViewerApp:
             return
         self.current_filepath = filepath
         fn = os.path.basename(filepath)
-        fs = os.path.getsize(filepath) / (1024*1024)
         self.root.title(f"{APP_NAME} — {fn}")
         self.status_label.config(text=f"\u23f3 {self.t('loading')} {fn}...")
         self.root.update()
@@ -628,27 +790,37 @@ class GCodeViewerApp:
         self.status_label.config(text=f"\u23f3 {self.t('parsing')} {fn}...")
         self.root.update()
         if self.parser.parse(filepath):
-            self.file_info.config(text=f"{fn}\n{fs:.1f} MB")
-            nl = len(self.parser.layers)
-            self.layer_slider.config(from_=0, to=max(0, nl-1))
-            self.layer_var.set(nl-1)
-            self.layer_label.config(text=f"Layer: {nl} / {nl}")
-            if self.parser.layers:
-                self.z_label.config(text=f"Z: {self.parser.layers[-1]:.2f} mm")
-            ec = sum(1 for s in self.parser.segments if s[6] == 'extrude')
-            tc = len(self.parser.segments) - ec
-            self.stats_label.config(
-                text=f"{self.t('layers_lbl')}: {nl}\n"
-                     f"{self.t('segments_lbl')}: {len(self.parser.segments):,}\n"
-                     f"{self.t('extrude_lbl')}: {ec:,}\n"
-                     f"{self.t('travel_lbl')}: {tc:,}\n"
-                     f"{self.t('thumb_lbl')}: {self.t('yes') if self.thumbnails else self.t('no')}")
-            self.viewport.set_model(self.parser)
+            self._sync_ui_to_parser()
             self.status_label.config(
-                text=f"\u2705 {fn} — {nl} layers, {len(self.parser.segments):,} segments")
+                text=f"\u2705 {fn} — {len(self.parser.layers)} layers, "
+                     f"{len(self.parser.segments):,} segments")
         else:
             self.status_label.config(text=f"\u26a0\ufe0f {self.t('no_path')} {fn}")
             messagebox.showwarning(self.t('warning'), self.t('no_path_msg'))
+
+    def _sync_ui_to_parser(self):
+        """Point all widgets at the current parser state."""
+        p = self.parser
+        nl = len(p.layers)
+        if self.current_filepath:
+            fn = os.path.basename(self.current_filepath)
+            fs = os.path.getsize(self.current_filepath) / (1024 * 1024)
+            self.file_info.config(text=f"{fn}\n{fs:.1f} MB")
+        self.layer_slider.config(from_=0, to=max(0, nl - 1))
+        self.layer_var.set(max(0, nl - 1))
+        self.layer_label.config(text=f"Layer: {nl} / {nl}")
+        if p.layers:
+            self.z_label.config(text=f"Z: {p.layers[-1]:.2f} mm")
+        ec = sum(1 for s in p.segments if s[6] == 'extrude')
+        tc = len(p.segments) - ec
+        self.stats_label.config(
+            text=f"{self.t('layers_lbl')}: {nl}\n"
+                 f"{self.t('segments_lbl')}: {len(p.segments):,}\n"
+                 f"{self.t('extrude_lbl')}: {ec:,}\n"
+                 f"{self.t('travel_lbl')}: {tc:,}\n"
+                 f"{self.t('thumb_lbl')}: {self.t('yes') if self.thumbnails else self.t('no')}")
+        self._update_meta_panel()
+        self.viewport.set_model(p)
 
     def _on_layer_change(self, val):
         layer = int(float(val))
@@ -734,22 +906,172 @@ class GCodeViewerApp:
             lbl.image = photo
             lbl.pack(pady=5)
 
+    def _fan_summary(self):
+        """Return human-readable fan speed summary as list of percentages."""
+        speeds = sorted(self.parser.fan_speeds)
+        if not speeds:
+            return None
+        pcts = []
+        for s in speeds:
+            if s <= 0:
+                pcts.append(self.t('off'))
+            else:
+                pcts.append(f"{round(s / 255 * 100)}%")
+        # Deduplicate preserving order
+        seen = []
+        for p in pcts:
+            if p not in seen:
+                seen.append(p)
+        return seen
+
+    def _update_meta_panel(self):
+        """Fill the Print Info panel with parsed metadata."""
+        p = self.parser
+        lines = []
+        # Layer height
+        lh = f"{p.layer_height:.2f} mm" if p.layer_height else self.t('unknown')
+        lines.append(f"{self.t('layer_height')}: {lh}")
+        # First layer
+        flh = f"{p.first_layer_height:.2f} mm" if p.first_layer_height else self.t('unknown')
+        lines.append(f"{self.t('first_layer')}: {flh}")
+        # Print time
+        pt = p.print_time if p.print_time else self.t('unknown')
+        lines.append(f"{self.t('print_time')}: {pt}")
+        # Filament
+        if p.filament_used:
+            lines.append(f"{self.t('filament')}: {p.filament_used:,.0f} mm")
+        # Fan speed
+        fans = self._fan_summary()
+        fan_str = ', '.join(fans) if fans else self.t('unknown')
+        lines.append(f"{self.t('fan_speed')}: {fan_str}")
+        # Slicer
+        if p.slicer:
+            lines.append(f"{self.t('slicer')}: {p.slicer}")
+        self.meta_label.config(text='\n'.join(lines))
+
+    def _show_fan_editor(self):
+        if not self.current_filepath:
+            messagebox.showinfo(self.t('info'), self.t('no_model'))
+            return
+        fans = self._fan_summary()
+        if not fans:
+            messagebox.showinfo(self.t('fan_editor'), self.t('no_fan'))
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(self.t('fan_editor'))
+        win.configure(bg=self.theme['bg'])
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        th = self.theme
+
+        tk.Label(win, text=f"\U0001f4a8 {self.t('fan_editor')}",
+                 font=('Segoe UI', 13, 'bold'), bg=th['bg'],
+                 fg=th['accent']).pack(pady=(15, 10), padx=20)
+
+        tk.Label(win, text=self.t('detected_fan'), bg=th['bg'], fg=th['text_dim'],
+                 font=('Segoe UI', 9)).pack(anchor=tk.W, padx=20)
+        tk.Label(win, text='  ' + ', '.join(fans), bg=th['bg'], fg=th['text'],
+                 font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, padx=20, pady=(0, 15))
+
+        # New fan speed input
+        frm = tk.Frame(win, bg=th['bg'])
+        frm.pack(padx=20, pady=(0, 5), fill=tk.X)
+        tk.Label(frm, text=self.t('new_fan'), bg=th['bg'], fg=th['text'],
+                 font=('Segoe UI', 10)).pack(side=tk.LEFT)
+        fan_pct = tk.IntVar(value=100)
+        spin = tk.Spinbox(frm, from_=0, to=100, increment=5, width=6,
+                          textvariable=fan_pct, font=('Segoe UI', 10))
+        spin.pack(side=tk.LEFT, padx=8)
+
+        # Slider for convenience
+        slider = ttk.Scale(win, from_=0, to=100, orient=tk.HORIZONTAL,
+                           command=lambda v: fan_pct.set(int(float(v))))
+        slider.set(100)
+        slider.pack(fill=tk.X, padx=20, pady=(5, 15))
+
+        def apply_save():
+            pct = max(0, min(100, fan_pct.get()))
+            new_s = round(pct / 100 * 255)
+            out = filedialog.asksaveasfilename(
+                parent=win, title=self.t('apply_save'),
+                defaultextension=".gcode",
+                initialfile=os.path.splitext(os.path.basename(self.current_filepath))[0] + "_fan.gcode",
+                filetypes=[("GCode", "*.gcode"), ("All", "*.*")])
+            if not out:
+                return
+            count = self._rewrite_fan(self.current_filepath, out, new_s)
+            messagebox.showinfo(self.t('success'),
+                                self.t('fan_saved').format(out) + "\n\n" +
+                                self.t('fan_replaced').format(count),
+                                parent=win)
+            win.destroy()
+
+        btn = tk.Button(win, text=self.t('apply_save'), command=apply_save,
+                        bg=th['success'], fg=th['bg'], relief=tk.FLAT,
+                        font=('Segoe UI', 10, 'bold'), padx=15, pady=6,
+                        cursor='hand2')
+        btn.pack(pady=(0, 18))
+
+    def _rewrite_fan(self, src, dst, new_s):
+        """Rewrite all M106 S>0 commands with new_s value. Returns count."""
+        count = 0
+        with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        out_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # only touch active M106 commands (not in comments)
+            if re.match(r'^M106\b', stripped, re.IGNORECASE):
+                m = re.search(r'[Ss]([\d.]+)', stripped)
+                if m and float(m.group(1)) > 0:
+                    if new_s <= 0:
+                        new_line = re.sub(r'^M106', 'M107', stripped, flags=re.IGNORECASE)
+                        new_line = re.sub(r'\s*[Ss][\d.]+', '', new_line)
+                    else:
+                        new_line = re.sub(r'([Ss])[\d.]+', rf'\g<1>{new_s}', stripped)
+                    # preserve line ending
+                    ending = '\n' if line.endswith('\n') else ''
+                    out_lines.append(new_line + ending)
+                    count += 1
+                    continue
+            out_lines.append(line)
+        with open(dst, 'w', encoding='utf-8') as f:
+            f.writelines(out_lines)
+        return count
+
     def _change_language(self, code):
         self.lang = code
         self.config['language'] = code
         save_config(self.config)
-        messagebox.showinfo(self.t('info'), self.t('restart_msg'))
+        self._rebuild_ui()
 
     def _change_theme(self, name):
         self.theme_name = name
         self.theme = get_theme(name)
         self.config['theme'] = name
         save_config(self.config)
-        # Apply immediately
+        self._rebuild_ui()
+
+    def _rebuild_ui(self):
+        """Recreate menubar and widgets so theme/language applies fully.
+
+        The windnd hook is NOT reinstalled: double hook = double file open.
+        """
+        self.root.config(menu='')
+        for w in self.root.winfo_children():
+            w.destroy()
         self._apply_theme()
-        self.viewport.set_theme(self.theme)
-        # Rebuild UI requires restart for full effect
-        messagebox.showinfo(self.t('info'), self.t('restart_msg'))
+        self._setup_menu()
+        self._setup_ui()
+        if self.parser.segments and self.current_filepath:
+            fn = os.path.basename(self.current_filepath)
+            self.root.title(f"{APP_NAME} — {fn}")
+            self._sync_ui_to_parser()
+            self.status_label.config(
+                text=f"\u2705 {fn} — {len(self.parser.layers)} layers, "
+                     f"{len(self.parser.segments):,} segments")
 
     def _show_shortcuts(self):
         txt = ("Ctrl+O = Open file\nCtrl+S = Save screenshot\n"
@@ -776,8 +1098,8 @@ class GCodeViewerApp:
 
         info = ("3D GCode preview viewer\n"
                 "with multi-language & theme support.\n\n"
-                "Supported slicers:\n"
-                "PrusaSlicer, SuperSlicer, Cura, Elegoo\n\n"
+                "Metadata detection:\n"
+                "PrusaSlicer, SuperSlicer, Cura, OrcaSlicer, Bambu Studio\n\n"
                 "Built with Python + Tkinter + Pillow")
         tk.Label(about_win, text=info, font=('Segoe UI', 9),
                  bg=self.theme['bg'], fg=self.theme['text'],
